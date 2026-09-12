@@ -1,1 +1,397 @@
+import { findByProps } from "@vendetta/metro";
+import { React, ReactNative } from "@vendetta/metro/common";
+import { plugin } from "@vendetta/plugin";
 
+const { ScrollView, View, Text, TextInput, TouchableOpacity } = ReactNative;
+
+type Scope = "everywhere" | "guild" | "dm" | "channel";
+type SortBy = "timestamp" | "relevance";
+type SortOrder = "asc" | "desc";
+
+type Location = {
+    id: string;
+    name: string;
+    type: "guild" | "dm" | "channel";
+    guildId?: string;
+};
+
+type Filters = {
+    author: string;
+    mention: string;
+    linkHostname: string;
+    attachmentExtension: string;
+    attachmentFilename: string;
+    before: string;
+    after: string;
+    authorType: string;
+};
+
+const defaults = {
+    defaultScope: "everywhere" as Scope,
+    defaultSort: "timestamp" as SortBy,
+    defaultOrder: "desc" as SortOrder,
+    parallelism: 4,
+    pageSize: 25,
+};
+
+function get<T>(key: string, fallback: T): T {
+    try {
+        const value = plugin.storage[key];
+        return value === undefined ? fallback : value as T;
+    } catch {
+        return fallback;
+    }
+}
+
+function set(key: string, value: unknown) {
+    plugin.storage[key] = value;
+}
+
+function api() {
+    return findByProps("get", "post") ?? findByProps("get", "request") ?? findByProps("request");
+}
+
+function auth() {
+    return findByProps("getToken", "getSessionId");
+}
+
+async function request(path: string, params: Record<string, string | number | boolean> = {}) {
+    const client = api();
+
+    if (client?.get) {
+        try {
+            return await client.get(path, params);
+        } catch {}
+    }
+
+    if (client?.request) {
+        try {
+            return await client.request({ method: "GET", url: path, query: params });
+        } catch {}
+    }
+
+    const token = auth()?.getToken?.();
+    if (!token) throw new Error("Discord request module unavailable.");
+
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null && value !== "") {
+            query.set(key, String(value));
+        }
+    }
+
+    const response = await fetch(`https://discord.com/api/v10${path}${query.toString() ? `?${query}` : ""}`, {
+        headers: { Authorization: token, Accept: "application/json" },
+    });
+
+    if (!response.ok) throw new Error(`Discord API ${response.status}`);
+    return response.json();
+}
+
+async function locations(): Promise<Location[]> {
+    const guilds = await request("/users/@me/guilds");
+    const dms = await request("/users/@me/channels");
+
+    const guildLocations: Location[] = (guilds ?? []).map((x: any) => ({
+        id: x.id,
+        name: x.name ?? "Unknown Server",
+        type: "guild",
+    }));
+
+    const dmLocations: Location[] = (dms ?? []).map((x: any) => ({
+        id: x.id,
+        name: x.name || x.recipients?.map((r: any) => r.username).join(", ") || "Direct Message",
+        type: "dm",
+    }));
+
+    const channels: Location[] = [];
+    const concurrency = Math.max(1, get("parallelism", defaults.parallelism));
+
+    for (let i = 0; i < guildLocations.length; i += concurrency) {
+        const batch = guildLocations.slice(i, i + concurrency);
+        const result = await Promise.all(batch.map(guild => request(`/guilds/${guild.id}/channels`)));
+        for (let i = 0; i < result.length; i++) {
+            for (const channel of result[i] ?? []) {
+                if (![0, 5, 10, 11, 12].includes(channel.type)) continue;
+                channels.push({
+                    id: channel.id,
+                    name: channel.name ?? "Unnamed Channel",
+                    type: "channel",
+                    guildId: batch[i].id,
+                });
+            }
+        }
+    }
+
+    return [...guildLocations, ...dmLocations, ...channels];
+}
+
+function queryParams(query: string, filters: Filters, sortBy: SortBy, sortOrder: SortOrder) {
+    const params: Record<string, string | number> = {
+        content: query,
+        sort_by: sortBy,
+        sort_order: sortOrder,
+        limit: get("pageSize", defaults.pageSize),
+    };
+
+    const map: Record<keyof Filters, string> = {
+        author: "author_id",
+        mention: "mentions",
+        linkHostname: "link_hostname",
+        attachmentExtension: "attachment_extension",
+        attachmentFilename: "attachment_filename",
+        before: "before",
+        after: "after",
+        authorType: "author_type",
+    };
+
+    for (const [key, apiKey] of Object.entries(map) as [keyof Filters, string][]) {
+        if (filters[key]) params[apiKey] = filters[key];
+    }
+
+    return params;
+}
+
+async function search(location: Location, query: string, filters: Filters, sortBy: SortBy, sortOrder: SortOrder) {
+    const path = location.type === "guild"
+        ? `/guilds/${location.id}/messages/search`
+        : `/channels/${location.id}/messages/search`;
+
+    return request(path, queryParams(query, filters, sortBy, sortOrder));
+}
+
+function normalize(data: any): any[] {
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.messages)) return data.messages.flat();
+    if (Array.isArray(data?.results)) return data.results;
+    return [];
+}
+
+async function pool<T>(items: T[], worker: (item: T) => Promise<any>, concurrency: number) {
+    const output: any[] = [];
+    let index = 0;
+
+    async function runner() {
+        while (index < items.length) {
+            const item = items[index++];
+            try {
+                output.push(await worker(item));
+            } catch {}
+        }
+    }
+
+    await Promise.all(
+        Array.from({ length: Math.min(Math.max(1, concurrency), items.length || 1) }, runner),
+    );
+
+    return output.flat();
+}
+
+function Button({ title, onPress }: { title: string; onPress: () => void }) {
+    return (
+        <TouchableOpacity
+            onPress={onPress}
+            style={{
+                paddingHorizontal: 14,
+                paddingVertical: 10,
+                borderRadius: 10,
+                backgroundColor: "#5865F2",
+                marginRight: 8,
+                marginBottom: 8,
+            }}
+        >
+            <Text style={{ color: "white", fontWeight: "700" }}>{title}</Text>
+        </TouchableOpacity>
+    );
+}
+
+function SearchScreen({ onClose }: { onClose: () => void }) {
+    const [query, setQuery] = React.useState("");
+    const [scope, setScope] = React.useState<Scope>(get("defaultScope", defaults.defaultScope));
+    const [sortBy, setSortBy] = React.useState<SortBy>(get("defaultSort", defaults.defaultSort));
+    const [sortOrder, setSortOrder] = React.useState<SortOrder>(get("defaultOrder", defaults.defaultOrder));
+    const [allLocations, setAllLocations] = React.useState<Location[]>([]);
+    const [selected, setSelected] = React.useState<Location | null>(null);
+    const [locationSearch, setLocationSearch] = React.useState("");
+    const [results, setResults] = React.useState<any[]>([]);
+    const [loading, setLoading] = React.useState(false);
+    const [error, setError] = React.useState("");
+    const [filters, setFilters] = React.useState<Filters>({
+        author: "",
+        mention: "",
+        linkHostname: "",
+        attachmentExtension: "",
+        attachmentFilename: "",
+        before: "",
+        after: "",
+        authorType: "",
+    });
+
+    React.useEffect(() => {
+        locations().then(setAllLocations).catch(error => setError(String(error)));
+    }, []);
+
+    const candidates = React.useMemo(() => {
+        if (scope === "guild") return allLocations.filter(x => x.type === "guild");
+        if (scope === "dm") return allLocations.filter(x => x.type === "dm");
+        if (scope === "channel") return allLocations.filter(x => x.type === "channel");
+        return allLocations.filter(x => x.type === "guild" || x.type === "dm");
+    }, [allLocations, scope]);
+
+    const visible = candidates
+        .filter(x => x.name.toLowerCase().includes(locationSearch.toLowerCase()))
+        .slice(0, 100);
+
+    async function runSearch() {
+        if (!query.trim() && !Object.values(filters).some(Boolean)) {
+            setError("Enter a search term or at least one filter.");
+            return;
+        }
+
+        setLoading(true);
+        setError("");
+
+        try {
+            const targets = selected ? [selected] : candidates;
+            const found = await pool(
+                targets,
+                target => search(target, query.trim(), filters, sortBy, sortOrder).then(normalize),
+                get("parallelism", defaults.parallelism),
+            );
+            setResults(found);
+        } catch (e) {
+            setError(String(e));
+        } finally {
+            setLoading(false);
+        }
+    }
+
+    function jump(channelId: string, messageId: string) {
+        const navigation = findByProps("openExternalUrl", "openURL");
+        const url = `https://discord.com/channels/@me/${channelId}/${messageId}`;
+        if (navigation?.openExternalUrl) return navigation.openExternalUrl(url);
+        if (navigation?.openURL) return navigation.openURL(url);
+    }
+
+    return (
+        <View style={{ flex: 1, backgroundColor: "#111214" }}>
+            <ScrollView contentContainerStyle={{ padding: 16 }}>
+                <Text style={{ color: "white", fontSize: 26, fontWeight: "800", marginBottom: 14 }}>Search+</Text>
+                <TextInput
+                    value={query}
+                    onChangeText={setQuery}
+                    placeholder="Search messages..."
+                    placeholderTextColor="#777"
+                    style={{ backgroundColor: "#1E1F22", color: "white", borderRadius: 12, padding: 13, marginBottom: 12 }}
+                />
+
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                    {(["everywhere", "guild", "dm", "channel"] as Scope[]).map(x => (
+                        <Button key={x} title={x} onPress={() => { setScope(x); setSelected(null); }} />
+                    ))}
+                </View>
+
+                <Text style={{ color: "#B5BAC1", marginTop: 8, marginBottom: 6 }}>Location</Text>
+                <TextInput
+                    value={locationSearch}
+                    onChangeText={setLocationSearch}
+                    placeholder="Filter servers, DMs and channels..."
+                    placeholderTextColor="#777"
+                    style={{ backgroundColor: "#1E1F22", color: "white", borderRadius: 10, padding: 11, marginBottom: 8 }}
+                />
+
+                <ScrollView horizontal>
+                    <View style={{ flexDirection: "row" }}>
+                        {visible.map(x => (
+                            <Button
+                                key={`${x.type}-${x.id}`}
+                                title={selected?.id === x.id ? `✓ ${x.name}` : x.name}
+                                onPress={() => setSelected(selected?.id === x.id ? null : x)}
+                            />
+                        ))}
+                    </View>
+                </ScrollView>
+
+                <Text style={{ color: "#B5BAC1", marginTop: 12 }}>Filters</Text>
+                {([
+                    ["author", "Author ID"],
+                    ["mention", "Mention ID"],
+                    ["linkHostname", "Link hostname"],
+                    ["attachmentExtension", "Attachment extension"],
+                    ["attachmentFilename", "Attachment filename"],
+                    ["before", "Before (date/message ID)"],
+                    ["after", "After (date/message ID)"],
+                    ["authorType", "Author type"],
+                ] as const).map(([key, placeholder]) => (
+                    <TextInput
+                        key={key}
+                        value={filters[key]}
+                        onChangeText={value => setFilters({ ...filters, [key]: value })}
+                        placeholder={placeholder}
+                        placeholderTextColor="#777"
+                        style={{ backgroundColor: "#1E1F22", color: "white", borderRadius: 10, padding: 11, marginTop: 8 }}
+                    />
+                ))}
+
+                <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 12 }}>
+                    <Button title={`Sort: ${sortBy}`} onPress={() => setSortBy(sortBy === "timestamp" ? "relevance" : "timestamp")} />
+                    <Button title={`Order: ${sortOrder}`} onPress={() => setSortOrder(sortOrder === "desc" ? "asc" : "desc")} />
+                    <Button title={loading ? "Searching..." : "Search"} onPress={runSearch} />
+                    <Button title="Close" onPress={onClose} />
+                </View>
+
+                {!!error && <Text style={{ color: "#ED4245", marginVertical: 10 }}>{error}</Text>}
+
+                {results.map((result, index) => {
+                    const message = result?.message ?? result;
+                    const channelId = message?.channel_id;
+                    const messageId = message?.id;
+
+                    return (
+                        <TouchableOpacity
+                            key={`${channelId}-${messageId}-${index}`}
+                            onPress={() => channelId && messageId && jump(channelId, messageId)}
+                            style={{ backgroundColor: "#1E1F22", borderRadius: 12, padding: 12, marginTop: 8 }}
+                        >
+                            <Text style={{ color: "#B5BAC1", fontSize: 12 }}>
+                                {message?.author?.username ?? "Unknown"} · {message?.timestamp ?? ""}
+                            </Text>
+                            <Text style={{ color: "white", marginTop: 5 }}>
+                                {message?.content || "(no text)"}
+                            </Text>
+                        </TouchableOpacity>
+                    );
+                })}
+            </ScrollView>
+        </View>
+    );
+}
+
+function openSearch() {
+    const navigation = findByProps("push", "pop", "replace");
+    if (navigation?.push) return navigation.push(SearchScreen, {});
+    const modal = findByProps("open", "close");
+    if (modal?.open) return modal.open(SearchScreen);
+    throw new Error("Could not find a compatible Shiggy navigation module.");
+}
+
+function Settings() {
+    return (
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16 }}>
+            <Text style={{ color: "white", fontSize: 26, fontWeight: "800", marginBottom: 8 }}>Search+</Text>
+            <Text style={{ color: "#B5BAC1", marginBottom: 16 }}>Advanced Discord message search.</Text>
+            <Button title="Open Search+" onPress={openSearch} />
+            <Text style={{ color: "#B5BAC1", marginTop: 20 }}>Defaults</Text>
+            <Button title={`Default scope: ${get("defaultScope", defaults.defaultScope)}`} onPress={() => set("defaultScope", get("defaultScope", defaults.defaultScope) === "everywhere" ? "guild" : "everywhere")} />
+            <Button title={`Sort: ${get("defaultSort", defaults.defaultSort)}`} onPress={() => set("defaultSort", get("defaultSort", defaults.defaultSort) === "timestamp" ? "relevance" : "timestamp")} />
+            <Button title={`Order: ${get("defaultOrder", defaults.defaultOrder)}`} onPress={() => set("defaultOrder", get("defaultOrder", defaults.defaultOrder) === "desc" ? "asc" : "desc")} />
+            <Button title={`Parallel searches: ${get("parallelism", defaults.parallelism)}`} onPress={() => { const value = get("parallelism", defaults.parallelism); set("parallelism", value >= 8 ? 1 : value + 1); }} />
+        </ScrollView>
+    );
+}
+
+export default {
+    onLoad() {},
+    onUnload() {},
+    settings: Settings,
+};
