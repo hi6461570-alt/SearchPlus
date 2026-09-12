@@ -1,26 +1,28 @@
 # Search+
 
-Advanced Discord message search plugin for ShiggyCord/Kettu. Ye.
+Advanced Discord message search plugin for ShiggyCord/Kettu.
 
-```text
-https://raw.githubusercontent.com/hi6461570-alt/SearchPlus/main/manifest.json
-```
+## Repository layout
 
-## Local build
+This repository follows the current multi-plugin Vendetta/Kettu-style layout:
+
+- `plugins/SearchPlus/index.ts` — plugin source
+- `plugins/SearchPlus/manifest.json` — source manifest
+- `base_manifest.json` — shared defaults
+- `scripts/build.mjs` — Rollup build
+- `dist/SearchPlus/` — generated installable plugin
+
+## Build
 
 ```bash
-npm install
-npm run build
+bun install
+bun run build
 ```
 
-The resulting plugin entry is:
+Install the generated manifest:
 
-```text
-dist/index.js
-```
+`dist/SearchPlus/manifest.json`
 
-## Updating
+For GitHub raw hosting, use:
 
-Push changes to `main`. GitHub Actions rebuilds `dist/index.js`.
-
-If Shiggy caches the old plugin, remove/re-add the plugin or use its plugin reload/update control.
+`https://raw.githubusercontent.com/hi6461570-alt/SearchPlus/main/dist/SearchPlus/manifest.json`

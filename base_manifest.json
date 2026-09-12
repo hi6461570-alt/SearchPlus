@@ -1,0 +1,12 @@
+{
+  "authors": [
+    {
+      "name": "Search+",
+      "id": "0"
+    }
+  ],
+  "main": "index.js",
+  "vendetta": {
+    "icon": "ic_search"
+  }
+}

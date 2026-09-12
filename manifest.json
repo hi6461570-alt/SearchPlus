@@ -1,9 +1,14 @@
 {
   "name": "Search+",
-  "description": "Advanced Discord message search for ShiggyCord/Kettu.",
+  "description": "Deep Discord message search with global, server, DM, and channel scopes.",
   "authors": [
-    "Search+"
+    {
+      "name": "Search+",
+      "id": "0"
+    }
   ],
-  "version": "1.0.0",
-  "main": "dist/index.js"
+  "main": "src/index.tsx",
+  "vendetta": {
+    "icon": "SearchIcon"
+  }
 }
