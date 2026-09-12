@@ -1,6 +1,6 @@
 # Search+
 
-Advanced Discord message search plugin for ShiggyCord/Kettu.
+Advanced Discord message search plugin for ShiggyCord/Kettu. Ye.
 
 ```text
 https://raw.githubusercontent.com/hi6461570-alt/SearchPlus/main/manifest.json
