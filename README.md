@@ -12,15 +12,7 @@ Advanced Discord message search plugin for ShiggyCord/Kettu.
 6. Add the raw URL to `manifest.json`:
 
 ```text
-https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/manifest.json
-```
-
-Replace `YOUR_USERNAME/YOUR_REPO` with your repository.
-
-The manifest points Shiggy to:
-
-```text
-https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/dist/index.js
+https://raw.githubusercontent.com/hi6461570-alt/SearchPlus/main/manifest.json
 ```
 
 ## Local build
@@ -41,9 +33,3 @@ dist/index.js
 Push changes to `main`. GitHub Actions rebuilds `dist/index.js`.
 
 If Shiggy caches the old plugin, remove/re-add the plugin or use its plugin reload/update control.
-
-## Notes
-
-Search+ uses Discord's existing client/API modules where available instead of requiring a separate backend.
-
-The exact internal module names can change between Shiggy/Kettu builds. If a future Shiggy build changes those internals, the discovery layer in `src/index.tsx` is the place to update.
