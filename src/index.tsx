@@ -1,567 +1,943 @@
-import { after, before, instead } from "@vendetta/patcher";
-import { find, findByName, findByProps, findByStoreName } from "@vendetta/metro";
-import { ReactNative } from "@vendetta/metro/common";
-import { React } from "@vendetta/metro/common";
-import { plugin } from "@vendetta/plugin";
-
-const { ScrollView, View, Text, TextInput, TouchableOpacity } = ReactNative;
+import { plugin } from "@vendetta";
+import { find, findByProps, findByName, findByStoreName } from "@vendetta/metro";
+import { React, ReactNative } from "@vendetta/metro/common";
 
 type Scope = "everywhere" | "guild" | "dm" | "channel";
-type SortBy = "timestamp" | "relevance";
-type SortOrder = "asc" | "desc";
+type Sort = "timestamp" | "relevance";
+type Order = "asc" | "desc";
 
 type Location = {
     id: string;
-    name: string;
     type: "guild" | "dm" | "channel";
-    parentId?: string;
+    name: string;
+    subtitle?: string;
+    icon?: string;
     guildId?: string;
 };
 
 type SearchFilters = {
-    author: string;
-    mention: string;
+    content: string;
+    authorId: string;
+    mentions: string;
+    has: string[];
     linkHostname: string;
     attachmentExtension: string;
     attachmentFilename: string;
     before: string;
     after: string;
-    authorType: string;
-    has: string[];
+    authorType: "" | "user" | "bot" | "webhook";
 };
 
-const defaults = {
+type SearchResult = {
+    id: string;
+    channelId: string;
+    guildId?: string | null;
+    content: string;
+    timestamp: string;
+    author?: {
+        id: string;
+        username?: string;
+        global_name?: string;
+        avatar?: string;
+    };
+    attachments?: any[];
+    embeds?: any[];
+};
+
+const RN = ReactNative;
+const { View, Text, ScrollView, Pressable, TextInput, ActivityIndicator } = RN;
+
+const DEFAULT_FILTERS: SearchFilters = {
+    content: "",
+    authorId: "",
+    mentions: "",
+    has: [],
+    linkHostname: "",
+    attachmentExtension: "",
+    attachmentFilename: "",
+    before: "",
+    after: "",
+    authorType: "",
+};
+
+const DEFAULTS = {
     enabled: true,
     defaultScope: "everywhere" as Scope,
-    defaultSort: "timestamp" as SortBy,
-    defaultOrder: "desc" as SortOrder,
+    defaultSort: "timestamp" as Sort,
+    defaultOrder: "desc" as Order,
     rememberHistory: true,
-    historyLimit: 20,
-    parallelism: 4,
+    historyLimit: 50,
+    parallelism: 5,
     pageSize: 25,
 };
 
-function storageGet<T>(key: string, fallback: T): T {
-    try {
-        const value = plugin.storage[key];
-        return value === undefined ? fallback : value as T;
-    } catch {
-        return fallback;
-    }
+const stores = {
+    guild: findByStoreName("GuildStore"),
+    channel: findByStoreName("ChannelStore"),
+    user: findByStoreName("UserStore"),
+    relationship: findByStoreName("RelationshipStore"),
+};
+
+const apiCandidates = [
+    findByProps("get", "post"),
+    findByProps("get", "request"),
+    findByProps("request"),
+    findByProps("getAPIBaseURL", "get"),
+].filter(Boolean);
+
+function getSetting<T>(key: string, fallback: T): T {
+    return plugin.storage[key] ?? fallback;
 }
 
-function storageSet(key: string, value: unknown) {
+function setSetting(key: string, value: unknown) {
     plugin.storage[key] = value;
 }
 
-function discoverApi() {
-    return (
-        findByProps("get", "post") ??
-        findByProps("get", "request") ??
-        findByProps("request") ??
-        findByProps("getAPIBaseURL", "get")
-    );
-}
-
-function discoverAuth() {
-    return findByProps("getToken", "getSessionId");
-}
-
-async function request(path: string, params: Record<string, string | number | boolean> = {}) {
-    const api = discoverApi();
-
-    if (api?.get) {
-        try {
-            return await api.get(path, params);
-        } catch {}
+function initialize() {
+    for (const [key, value] of Object.entries(DEFAULTS)) {
+        if (plugin.storage[key] === undefined) setSetting(key, value);
     }
 
-    if (api?.request) {
-        try {
+    if (!Array.isArray(plugin.storage.history)) setSetting("history", []);
+    if (!Array.isArray(plugin.storage.saved)) setSetting("saved", []);
+}
+
+function getApiModule(): any {
+    return apiCandidates.find(Boolean);
+}
+
+function buildQuery(filters: SearchFilters, sort: Sort, order: Order) {
+    const params = new URLSearchParams();
+
+    if (filters.content.trim()) params.set("content", filters.content.trim());
+    if (filters.authorId.trim()) params.set("author_id", filters.authorId.trim());
+    if (filters.mentions.trim()) params.set("mentions", filters.mentions.trim());
+    if (filters.linkHostname.trim()) params.set("link_hostname", filters.linkHostname.trim());
+    if (filters.attachmentExtension.trim()) params.set("attachment_extension", filters.attachmentExtension.trim());
+    if (filters.attachmentFilename.trim()) params.set("attachment_filename", filters.attachmentFilename.trim());
+
+    if (filters.before.trim()) params.set("before", filters.before.trim());
+    if (filters.after.trim()) params.set("after", filters.after.trim());
+
+    if (filters.authorType) params.set("author_type", filters.authorType);
+
+    for (const item of filters.has) params.append("has", item);
+
+    params.set("sort_by", sort === "relevance" ? "relevance" : "timestamp");
+    params.set("sort_order", order);
+    params.set("limit", String(getSetting("pageSize", 25)));
+
+    return params;
+}
+
+async function internalRequest(method: "GET" | "POST", path: string, params?: Record<string, unknown>) {
+    const api = getApiModule();
+
+    if (api) {
+        if (typeof api.get === "function") {
+            try {
+                return await api.get(path, params);
+            } catch {}
+
+            try {
+                return await api.get(path.startsWith("/") ? path.slice(1) : path, params);
+            } catch {}
+        }
+
+        if (typeof api.request === "function") {
             return await api.request({
-                method: "GET",
+                method,
                 url: path,
                 query: params,
+                body: params,
             });
-        } catch {}
+        }
     }
 
-    const auth = discoverAuth();
-    const token = auth?.getToken?.();
+    const auth = findByProps("getToken", "getSessionId");
+    const superProperties = findByProps("getSuperPropertiesBase64");
 
-    if (!token) throw new Error("Discord request module unavailable.");
+    const token = auth?.getToken?.();
+    if (!token) {
+        throw new Error("Shiggy's authenticated request module was not found.");
+    }
 
     const query = new URLSearchParams();
-    for (const [key, value] of Object.entries(params)) {
-        if (value !== undefined && value !== null && value !== "") query.set(key, String(value));
+
+    if (params) {
+        for (const [key, value] of Object.entries(params)) {
+            if (Array.isArray(value)) {
+                for (const item of value) query.append(key, String(item));
+            } else if (value !== undefined && value !== null) {
+                query.set(key, String(value));
+            }
+        }
     }
 
-    const url = `https://discord.com/api/v10${path}${query.toString() ? `?${query}` : ""}`;
+    const url = `https://discord.com/api/v10${path}${query.size ? `?${query}` : ""}`;
+
+    const headers: Record<string, string> = {
+        Authorization: token,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+    };
+
+    const encoded = superProperties?.getSuperPropertiesBase64?.();
+    if (encoded) headers["X-Super-Properties"] = encoded;
+
     const response = await fetch(url, {
-        headers: {
-            Authorization: token,
-            Accept: "application/json",
-        },
+        method,
+        headers,
     });
 
-    if (!response.ok) throw new Error(`Discord API ${response.status}`);
+    if (!response.ok) {
+        throw new Error(`Discord returned HTTP ${response.status}`);
+    }
+
     return response.json();
 }
 
 async function fetchGuilds(): Promise<Location[]> {
-    const data = await request("/users/@me/guilds");
-    return (data ?? []).map((guild: any) => ({
+    const result = await internalRequest("GET", "/users/@me/guilds");
+    const guilds = Array.isArray(result) ? result : result?.guilds ?? [];
+
+    return guilds.map((guild: any) => ({
         id: guild.id,
-        name: guild.name ?? "Unknown Server",
-        type: "guild",
+        type: "guild" as const,
+        name: guild.name ?? "Unnamed server",
+        subtitle: `${guild.id}`,
+        icon: guild.icon,
     }));
 }
 
 async function fetchDMs(): Promise<Location[]> {
-    const data = await request("/users/@me/channels");
-    return (data ?? []).map((channel: any) => ({
-        id: channel.id,
-        name: channel.name || channel.recipients?.map((x: any) => x.username).join(", ") || "Direct Message",
-        type: "dm",
-    }));
+    const result = await internalRequest("GET", "/users/@me/channels");
+    const channels = Array.isArray(result) ? result : result?.channels ?? [];
+
+    return channels
+        .filter((channel: any) => channel?.id)
+        .map((channel: any) => {
+            const recipients = channel.recipients ?? [];
+            const name =
+                channel.name ||
+                recipients
+                    .map((user: any) => user.global_name || user.username)
+                    .filter(Boolean)
+                    .join(", ") ||
+                "Direct Message";
+
+            return {
+                id: channel.id,
+                type: "dm" as const,
+                name,
+                subtitle: channel.type === 3 ? "Group DM" : "Direct Message",
+            };
+        });
 }
 
 async function fetchGuildChannels(guildId: string): Promise<Location[]> {
-    const data = await request(`/guilds/${guildId}/channels`);
-    return (data ?? [])
-        .filter((channel: any) => [0, 5, 10, 11, 12].includes(channel.type))
+    const result = await internalRequest("GET", `/guilds/${guildId}/channels`);
+    const channels = Array.isArray(result) ? result : result?.channels ?? [];
+
+    return channels
+        .filter((channel: any) => [0, 5, 10, 11, 12].includes(channel?.type))
         .map((channel: any) => ({
             id: channel.id,
-            name: channel.name ?? "Unnamed Channel",
-            type: "channel",
-            parentId: channel.parent_id ?? undefined,
+            type: "channel" as const,
+            name: `#${channel.name ?? channel.id}`,
+            subtitle: guildId,
             guildId,
         }));
 }
 
 async function loadLocations(): Promise<Location[]> {
-    const [guilds, dms] = await Promise.all([fetchGuilds(), fetchDMs()]);
+    const [guilds, dms] = await Promise.all([
+        fetchGuilds().catch(() => []),
+        fetchDMs().catch(() => []),
+    ]);
+
     const channels: Location[] = [];
 
-    for (let i = 0; i < guilds.length; i += Math.max(1, storageGet("parallelism", defaults.parallelism))) {
-        const batch = guilds.slice(i, i + Math.max(1, storageGet("parallelism", defaults.parallelism)));
-        const result = await Promise.all(batch.map(x => fetchGuildChannels(x.id)));
-        channels.push(...result.flat());
+    for (const guild of guilds) {
+        try {
+            channels.push(...await fetchGuildChannels(guild.id));
+        } catch {}
     }
 
     return [...guilds, ...dms, ...channels];
 }
 
-function buildQuery(query: string, filters: SearchFilters, sortBy: SortBy, sortOrder: SortOrder, limit: number) {
-    const params: Record<string, string | number> = {
-        content: query,
-        sort_by: sortBy,
-        sort_order: sortOrder,
-        limit,
-    };
+function normalizeResponse(data: any): SearchResult[] {
+    const messages = data?.messages ?? data?.results ?? data ?? [];
+    const flattened = Array.isArray(messages)
+        ? messages.flatMap((item: any) => Array.isArray(item) ? item : [item])
+        : [];
 
-    const entries: [keyof SearchFilters, string][] = [
-        ["author", "author_id"],
-        ["mention", "mentions"],
-        ["linkHostname", "link_hostname"],
-        ["attachmentExtension", "attachment_extension"],
-        ["attachmentFilename", "attachment_filename"],
-        ["before", "before"],
-        ["after", "after"],
-        ["authorType", "author_type"],
-    ];
-
-    for (const [key, apiKey] of entries) {
-        if (filters[key]) params[apiKey] = filters[key] as string;
-    }
-
-    if (filters.has.length) params.has = filters.has.join(",");
-
-    return params;
+    return flattened
+        .filter((message: any) => message?.id && message?.channel_id)
+        .map((message: any) => ({
+            id: message.id,
+            channelId: message.channel_id,
+            guildId: message.guild_id ?? null,
+            content: message.content ?? "",
+            timestamp: message.timestamp ?? new Date().toISOString(),
+            author: message.author,
+            attachments: message.attachments ?? [],
+            embeds: message.embeds ?? [],
+        }));
 }
 
-async function searchLocation(
-    location: Location,
-    query: string,
-    filters: SearchFilters,
-    sortBy: SortBy,
-    sortOrder: SortOrder,
-    limit: number,
-) {
-    const path = location.type === "guild"
-        ? `/guilds/${location.id}/messages/search`
-        : `/channels/${location.id}/messages/search`;
+async function searchLocation(location: Location, filters: SearchFilters, sort: Sort, order: Order): Promise<SearchResult[]> {
+    const params = Object.fromEntries(buildQuery(filters, sort, order).entries());
 
-    return request(path, buildQuery(query, filters, sortBy, sortOrder, limit));
+    const path =
+        location.type === "guild"
+            ? `/guilds/${location.id}/messages/search`
+            : `/channels/${location.id}/messages/search`;
+
+    const data = await internalRequest("GET", path, params);
+    return normalizeResponse(data);
 }
 
-function normalizeResponse(data: any): any[] {
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data?.messages)) return data.messages.flat();
-    if (Array.isArray(data?.results)) return data.results;
-    return [];
-}
-
-async function runPool<T>(items: T[], worker: (item: T) => Promise<any>, concurrency: number) {
-    const output: any[] = [];
-    let index = 0;
+async function runPool<T, R>(
+    values: T[],
+    worker: (value: T) => Promise<R>,
+    concurrency: number,
+): Promise<R[]> {
+    const results: R[] = [];
+    let cursor = 0;
 
     async function runner() {
-        while (index < items.length) {
-            const item = items[index++];
+        while (true) {
+            const index = cursor++;
+            if (index >= values.length) return;
+
             try {
-                output.push(await worker(item));
-            } catch {}
+                results[index] = await worker(values[index]);
+            } catch {
+                results[index] = undefined as R;
+            }
         }
     }
 
     await Promise.all(
         Array.from(
-            { length: Math.min(Math.max(1, concurrency), items.length || 1) },
+            { length: Math.max(1, Math.min(concurrency, values.length || 1)) },
             runner,
         ),
     );
 
-    return output.flat();
+    return results;
 }
 
-function jumpToResult(channelId: string, messageId: string) {
-    const url = `https://discord.com/channels/@me/${channelId}/${messageId}`;
-    const navigation = findByProps("openExternalUrl", "openURL");
+function addHistory(query: string, scope: Scope, location?: Location) {
+    if (!getSetting("rememberHistory", true) || !query.trim()) return;
 
-    if (navigation?.openExternalUrl) {
-        navigation.openExternalUrl(url);
+    const history = Array.isArray(plugin.storage.history)
+        ? plugin.storage.history
+        : [];
+
+    const entry = {
+        query: query.trim(),
+        scope,
+        locationId: location?.id,
+        locationName: location?.name,
+        time: Date.now(),
+    };
+
+    const next = [
+        entry,
+        ...history.filter(
+            (item: any) =>
+                item.query !== entry.query ||
+                item.scope !== entry.scope ||
+                item.locationId !== entry.locationId,
+        ),
+    ].slice(0, getSetting("historyLimit", 50));
+
+    setSetting("history", next);
+}
+
+function jumpToResult(result: SearchResult) {
+    const guild = result.guildId ?? "@me";
+    const url =
+        guild === "@me"
+            ? `https://discord.com/channels/@me/${result.channelId}/${result.id}`
+            : `https://discord.com/channels/${guild}/${result.channelId}/${result.id}`;
+
+    const opener = findByProps("openExternalUrl", "openURL");
+    if (opener?.openExternalUrl) {
+        opener.openExternalUrl(url);
         return;
     }
 
-    if (navigation?.openURL) {
-        navigation.openURL(url);
+    if (opener?.openURL) {
+        opener.openURL(url);
         return;
     }
 
-    ReactNative.Linking?.openURL?.(url);
+    RN.Linking?.openURL?.(url);
 }
 
-function Button({ title, onPress }: { title: string; onPress: () => void }) {
+function Label({ children }: { children: React.ReactNode }) {
+    return <Text style={{ color: "#f2f3f5", fontSize: 15, fontWeight: "600", marginBottom: 7 }}>{children}</Text>;
+}
+
+function Input(props: any) {
     return (
-        <TouchableOpacity
+        <TextInput
+            {...props}
+            placeholderTextColor="#72767d"
+            style={{
+                backgroundColor: "#1e1f22",
+                borderRadius: 10,
+                color: "#f2f3f5",
+                paddingHorizontal: 13,
+                paddingVertical: 11,
+                marginBottom: 12,
+                ...props.style,
+            }}
+        />
+    );
+}
+
+function Button({ title, onPress, disabled = false }: { title: string; onPress: () => void; disabled?: boolean }) {
+    return (
+        <Pressable
+            disabled={disabled}
             onPress={onPress}
             style={{
-                paddingHorizontal: 14,
-                paddingVertical: 10,
+                backgroundColor: disabled ? "#313338" : "#5865f2",
+                paddingHorizontal: 16,
+                paddingVertical: 12,
                 borderRadius: 10,
-                backgroundColor: "#5865F2",
-                marginRight: 8,
-                marginBottom: 8,
+                marginBottom: 10,
             }}
         >
-            <Text style={{ color: "white", fontWeight: "700" }}>{title}</Text>
-        </TouchableOpacity>
+            <Text style={{ color: "#fff", textAlign: "center", fontWeight: "700" }}>{title}</Text>
+        </Pressable>
     );
 }
 
-function SearchScreen({ onClose }: { onClose: () => void }) {
-    const [query, setQuery] = React.useState("");
-    const [scope, setScope] = React.useState<Scope>(storageGet("defaultScope", defaults.defaultScope));
-    const [sortBy, setSortBy] = React.useState<SortBy>(storageGet("defaultSort", defaults.defaultSort));
-    const [sortOrder, setSortOrder] = React.useState<SortOrder>(storageGet("defaultOrder", defaults.defaultOrder));
-    const [locations, setLocations] = React.useState<Location[]>([]);
-    const [selected, setSelected] = React.useState<Location | null>(null);
-    const [locationSearch, setLocationSearch] = React.useState("");
-    const [results, setResults] = React.useState<any[]>([]);
-    const [error, setError] = React.useState("");
-    const [loading, setLoading] = React.useState(false);
-
-    const [filters, setFilters] = React.useState<SearchFilters>({
-        author: "",
-        mention: "",
-        linkHostname: "",
-        attachmentExtension: "",
-        attachmentFilename: "",
-        before: "",
-        after: "",
-        authorType: "",
-        has: [],
-    });
-
-    React.useEffect(() => {
-        loadLocations()
-            .then(setLocations)
-            .catch(error => setError(String(error)));
-    }, []);
-
-    const visibleLocations = locations.filter(x =>
-        x.name.toLowerCase().includes(locationSearch.toLowerCase()),
-    );
-
-    const candidates = React.useMemo(() => {
-        if (scope === "guild") return locations.filter(x => x.type === "guild");
-        if (scope === "dm") return locations.filter(x => x.type === "dm");
-        if (scope === "channel") return locations.filter(x => x.type === "channel");
-        return locations.filter(x => x.type === "guild" || x.type === "dm");
-    }, [locations, scope]);
-
-    async function search() {
-        if (!query.trim() && !Object.values(filters).some(x => Array.isArray(x) ? x.length : x)) {
-            setError("Enter a search term or at least one filter.");
-            return;
-        }
-
-        setLoading(true);
-        setError("");
-
-        try {
-            const targets = selected
-                ? [selected]
-                : candidates;
-
-            const found = await runPool(
-                targets,
-                location => searchLocation(
-                    location,
-                    query.trim(),
-                    filters,
-                    sortBy,
-                    sortOrder,
-                    storageGet("pageSize", defaults.pageSize),
-                ).then(normalizeResponse),
-                storageGet("parallelism", defaults.parallelism),
-            );
-
-            setResults(found);
-
-            if (storageGet("rememberHistory", defaults.rememberHistory)) {
-                const history = storageGet<string[]>("history", []);
-                const next = [query, ...history.filter(x => x !== query)].slice(
-                    0,
-                    storageGet("historyLimit", defaults.historyLimit),
-                );
-                storageSet("history", next);
-            }
-        } catch (e) {
-            setError(String(e));
-        } finally {
-            setLoading(false);
-        }
-    }
-
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
     return (
-        <View style={{ flex: 1, backgroundColor: "#111214" }}>
-            <ScrollView contentContainerStyle={{ padding: 16 }}>
-                <Text style={{ color: "white", fontSize: 26, fontWeight: "800", marginBottom: 14 }}>
-                    Search+
-                </Text>
-
-                <TextInput
-                    value={query}
-                    onChangeText={setQuery}
-                    placeholder="Search messages..."
-                    placeholderTextColor="#777"
-                    style={{
-                        backgroundColor: "#1E1F22",
-                        color: "white",
-                        borderRadius: 12,
-                        padding: 13,
-                        marginBottom: 12,
-                    }}
-                />
-
-                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
-                    {(["everywhere", "guild", "dm", "channel"] as Scope[]).map(x => (
-                        <Button title={x} onPress={() => {
-                            setScope(x);
-                            setSelected(null);
-                        }} />
-                    ))}
-                </View>
-
-                <Text style={{ color: "#B5BAC1", marginTop: 8, marginBottom: 6 }}>
-                    Location
-                </Text>
-
-                <TextInput
-                    value={locationSearch}
-                    onChangeText={setLocationSearch}
-                    placeholder="Filter locations..."
-                    placeholderTextColor="#777"
-                    style={{
-                        backgroundColor: "#1E1F22",
-                        color: "white",
-                        borderRadius: 10,
-                        padding: 11,
-                        marginBottom: 8,
-                    }}
-                />
-
-                <View style={{ maxHeight: 180 }}>
-                    <ScrollView horizontal>
-                        <View style={{ flexDirection: "row" }}>
-                            {visibleLocations
-                                .filter(x => candidates.includes(x))
-                                .slice(0, 100)
-                                .map(x => (
-                                    <Button
-                                        title={selected?.id === x.id ? `✓ ${x.name}` : x.name}
-                                        onPress={() => setSelected(selected?.id === x.id ? null : x)}
-                                    />
-                                ))}
-                        </View>
-                    </ScrollView>
-                </View>
-
-                <Text style={{ color: "#B5BAC1", marginTop: 10 }}>
-                    Filters
-                </Text>
-
-                {[
-                    ["author", "Author ID"],
-                    ["mention", "Mention ID"],
-                    ["linkHostname", "Link hostname"],
-                    ["attachmentExtension", "Attachment extension"],
-                    ["attachmentFilename", "Attachment filename"],
-                    ["before", "Before (date/message ID)"],
-                    ["after", "After (date/message ID)"],
-                    ["authorType", "Author type"],
-                ].map(([key, placeholder]) => (
-                    <TextInput
-                        key={key}
-                        value={(filters as any)[key]}
-                        onChangeText={value => setFilters({ ...filters, [key]: value })}
-                        placeholder={placeholder}
-                        placeholderTextColor="#777"
-                        style={{
-                            backgroundColor: "#1E1F22",
-                            color: "white",
-                            borderRadius: 10,
-                            padding: 11,
-                            marginTop: 8,
-                        }}
-                    />
-                ))}
-
-                <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 12 }}>
-                    <Button title={`Sort: ${sortBy}`} onPress={() => setSortBy(sortBy === "timestamp" ? "relevance" : "timestamp")} />
-                    <Button title={`Order: ${sortOrder}`} onPress={() => setSortOrder(sortOrder === "desc" ? "asc" : "desc")} />
-                    <Button title={loading ? "Searching..." : "Search"} onPress={search} />
-                    <Button title="Close" onPress={onClose} />
-                </View>
-
-                {!!error && (
-                    <Text style={{ color: "#ED4245", marginVertical: 10 }}>
-                        {error}
-                    </Text>
-                )}
-
-                {results.map((result, index) => {
-                    const message = result?.message ?? result;
-                    const channelId = message?.channel_id;
-                    const messageId = message?.id;
-
-                    return (
-                        <TouchableOpacity
-                            key={`${channelId}-${messageId}-${index}`}
-                            onPress={() => channelId && messageId && jumpToResult(channelId, messageId)}
-                            style={{
-                                backgroundColor: "#1E1F22",
-                                borderRadius: 12,
-                                padding: 12,
-                                marginTop: 8,
-                            }}
-                        >
-                            <Text style={{ color: "#B5BAC1", fontSize: 12 }}>
-                                {message?.author?.username ?? "Unknown"} · {message?.timestamp ?? ""}
-                            </Text>
-                            <Text style={{ color: "white", marginTop: 5 }}>
-                                {message?.content || "(no text)"}
-                            </Text>
-                        </TouchableOpacity>
-                    );
-                })}
-            </ScrollView>
+        <View style={{ marginBottom: 18 }}>
+            <Text style={{ color: "#949ba4", fontSize: 12, fontWeight: "800", marginBottom: 8, textTransform: "uppercase" }}>
+                {title}
+            </Text>
+            <View style={{ backgroundColor: "#2b2d31", borderRadius: 12, padding: 12 }}>
+                {children}
+            </View>
         </View>
     );
 }
 
-function openSearchScreen() {
-    const navigation = findByProps("push", "pop", "replace");
-
-    if (navigation?.push) {
-        navigation.push(SearchScreen, {});
-        return;
-    }
-
-    const modal = findByProps("open", "close");
-
-    if (modal?.open) {
-        modal.open(SearchScreen);
-        return;
-    }
-
-    throw new Error("Could not find a compatible Shiggy navigation module.");
-}
-
 function Settings() {
+    const [, refresh] = React.useReducer((value: number) => value + 1, 0);
+
+    const update = (key: string, value: unknown) => {
+        setSetting(key, value);
+        refresh();
+    };
+
     return (
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16 }}>
-            <Text style={{ color: "white", fontSize: 26, fontWeight: "800", marginBottom: 8 }}>
+        <ScrollView style={{ flex: 1, backgroundColor: "#111214" }} contentContainerStyle={{ padding: 16 }}>
+            <Text style={{ color: "#f2f3f5", fontSize: 24, fontWeight: "800", marginBottom: 4 }}>
                 Search+
             </Text>
-
-            <Text style={{ color: "#B5BAC1", marginBottom: 16 }}>
-                Advanced message search for ShiggyCord.
+            <Text style={{ color: "#949ba4", marginBottom: 20 }}>
+                Deep message search across servers, DMs and channels.
             </Text>
 
-            <Button title="Open Search+" onPress={openSearchScreen} />
+            <Section title="General">
+                <Text style={{ color: "#f2f3f5", fontSize: 15, marginBottom: 12 }}>
+                    Open Search+ from this plugin's settings page to search Discord.
+                </Text>
+                <Button title="Open Search+" onPress={() => openSearchScreen()} />
+            </Section>
 
-            <Text style={{ color: "#B5BAC1", marginTop: 20 }}>
-                Defaults
-            </Text>
+            <Section title="Defaults">
+                <Label>Default scope</Label>
+                <Input
+                    value={getSetting("defaultScope", "everywhere")}
+                    onChangeText={(value: string) => update("defaultScope", value)}
+                    placeholder="everywhere / guild / dm / channel"
+                />
 
-            <Button
-                title={`Default scope: ${storageGet("defaultScope", defaults.defaultScope)}`}
-                onPress={() => storageSet(
-                    "defaultScope",
-                    storageGet("defaultScope", defaults.defaultScope) === "everywhere" ? "guild" : "everywhere",
-                )}
-            />
+                <Label>Default sort</Label>
+                <Input
+                    value={getSetting("defaultSort", "timestamp")}
+                    onChangeText={(value: string) => update("defaultSort", value)}
+                    placeholder="timestamp / relevance"
+                />
 
-            <Button
-                title={`Sort: ${storageGet("defaultSort", defaults.defaultSort)}`}
-                onPress={() => storageSet(
-                    "defaultSort",
-                    storageGet("defaultSort", defaults.defaultSort) === "timestamp" ? "relevance" : "timestamp",
-                )}
-            />
+                <Label>Default order</Label>
+                <Input
+                    value={getSetting("defaultOrder", "desc")}
+                    onChangeText={(value: string) => update("defaultOrder", value)}
+                    placeholder="desc / asc"
+                />
+            </Section>
 
-            <Button
-                title={`Order: ${storageGet("defaultOrder", defaults.defaultOrder)}`}
-                onPress={() => storageSet(
-                    "defaultOrder",
-                    storageGet("defaultOrder", defaults.defaultOrder) === "desc" ? "asc" : "desc",
-                )}
-            />
+            <Section title="Performance">
+                <Label>Parallel searches</Label>
+                <Input
+                    keyboardType="numeric"
+                    value={String(getSetting("parallelism", 5))}
+                    onChangeText={(value: string) =>
+                        update("parallelism", Math.max(1, Math.min(15, Number(value) || 5)))
+                    }
+                />
 
-            <Button
-                title={`Remember history: ${storageGet("rememberHistory", defaults.rememberHistory) ? "ON" : "OFF"}`}
-                onPress={() => storageSet(
-                    "rememberHistory",
-                    !storageGet("rememberHistory", defaults.rememberHistory),
-                )}
-            />
+                <Label>Results per location</Label>
+                <Input
+                    keyboardType="numeric"
+                    value={String(getSetting("pageSize", 25))}
+                    onChangeText={(value: string) =>
+                        update("pageSize", Math.max(10, Math.min(100, Number(value) || 25)))
+                    }
+                />
+            </Section>
 
-            <Button
-                title={`Parallel searches: ${storageGet("parallelism", defaults.parallelism)}`}
-                onPress={() => {
-                    const value = storageGet("parallelism", defaults.parallelism);
-                    storageSet("parallelism", value >= 8 ? 1 : value + 1);
-                }}
-            />
+            <Section title="History">
+                <Label>History limit</Label>
+                <Input
+                    keyboardType="numeric"
+                    value={String(getSetting("historyLimit", 50))}
+                    onChangeText={(value: string) =>
+                        update("historyLimit", Math.max(0, Math.min(500, Number(value) || 50)))
+                    }
+                />
+
+                <Button
+                    title="Clear Search History"
+                    onPress={() => {
+                        setSetting("history", []);
+                        refresh();
+                    }}
+                />
+            </Section>
         </ScrollView>
     );
 }
 
+function LocationRow({
+    location,
+    selected,
+    onPress,
+}: {
+    location: Location;
+    selected: boolean;
+    onPress: () => void;
+}) {
+    return (
+        <Pressable
+            onPress={onPress}
+            style={{
+                padding: 13,
+                borderRadius: 10,
+                backgroundColor: selected ? "#404675" : "#2b2d31",
+                marginBottom: 7,
+            }}
+        >
+            <Text style={{ color: "#f2f3f5", fontWeight: "700" }}>{location.name}</Text>
+            {!!location.subtitle && (
+                <Text style={{ color: "#949ba4", fontSize: 12, marginTop: 3 }}>{location.subtitle}</Text>
+            )}
+        </Pressable>
+    );
+}
+
+function SearchScreen() {
+    const [query, setQuery] = React.useState("");
+    const [scope, setScope] = React.useState<Scope>(getSetting("defaultScope", "everywhere"));
+    const [sort, setSort] = React.useState<Sort>(getSetting("defaultSort", "timestamp"));
+    const [order, setOrder] = React.useState<Order>(getSetting("defaultOrder", "desc"));
+    const [filters, setFilters] = React.useState<SearchFilters>({ ...DEFAULT_FILTERS });
+    const [locations, setLocations] = React.useState<Location[]>([]);
+    const [locationSearch, setLocationSearch] = React.useState("");
+    const [selected, setSelected] = React.useState<Location | undefined>();
+    const [results, setResults] = React.useState<SearchResult[]>([]);
+    const [loadingLocations, setLoadingLocations] = React.useState(true);
+    const [loadingSearch, setLoadingSearch] = React.useState(false);
+    const [error, setError] = React.useState("");
+
+    React.useEffect(() => {
+        let alive = true;
+
+        setLoadingLocations(true);
+        loadLocations()
+            .then(value => {
+                if (alive) setLocations(value);
+            })
+            .catch(error => {
+                if (alive) setError(String(error?.message ?? error));
+            })
+            .finally(() => {
+                if (alive) setLoadingLocations(false);
+            });
+
+        return () => {
+            alive = false;
+        };
+    }, []);
+
+    const filteredLocations = React.useMemo(() => {
+        const needle = locationSearch.trim().toLowerCase();
+
+        return locations.filter(location => {
+            if (!needle) return true;
+            return `${location.name} ${location.subtitle ?? ""}`.toLowerCase().includes(needle);
+        });
+    }, [locations, locationSearch]);
+
+    async function executeSearch() {
+        setError("");
+        setResults([]);
+
+        if (!query.trim()) {
+            setError("Enter a message search first.");
+            return;
+        }
+
+        if (scope !== "everywhere" && !selected) {
+            setError("Choose a server, DM, or channel.");
+            return;
+        }
+
+        setLoadingSearch(true);
+
+        try {
+            const targets =
+                scope === "everywhere"
+                    ? locations.filter(location => location.type === "guild" || location.type === "dm")
+                    : [selected!];
+
+            addHistory(query, scope, selected);
+
+            const nextFilters = {
+                ...filters,
+                content: query,
+            };
+
+            const chunks = await runPool(
+                targets,
+                target => searchLocation(target, nextFilters, sort, order),
+                getSetting("parallelism", 5),
+            );
+
+            const merged = chunks
+                .flatMap(chunk => chunk ?? [])
+                .sort((a, b) => {
+                    const left = Date.parse(a.timestamp);
+                    const right = Date.parse(b.timestamp);
+                    return order === "desc" ? right - left : left - right;
+                });
+
+            const unique = new Map<string, SearchResult>();
+            for (const result of merged) unique.set(result.id, result);
+
+            setResults([...unique.values()]);
+        } catch (searchError: any) {
+            setError(String(searchError?.message ?? searchError));
+        } finally {
+            setLoadingSearch(false);
+        }
+    }
+
+    return (
+        <ScrollView style={{ flex: 1, backgroundColor: "#111214" }} contentContainerStyle={{ padding: 16 }}>
+            <Text style={{ color: "#f2f3f5", fontSize: 25, fontWeight: "800", marginBottom: 4 }}>
+                Search+
+            </Text>
+
+            <Text style={{ color: "#949ba4", marginBottom: 15 }}>
+                Search messages across your Discord account.
+            </Text>
+
+            <Input
+                value={query}
+                onChangeText={setQuery}
+                placeholder="Search messages..."
+                returnKeyType="search"
+                onSubmitEditing={executeSearch}
+            />
+
+            <Section title="Scope">
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                    {(["everywhere", "guild", "dm", "channel"] as Scope[]).map(value => (
+                        <Pressable
+                            key={value}
+                            onPress={() => {
+                                setScope(value);
+                                setSelected(undefined);
+                            }}
+                            style={{
+                                paddingHorizontal: 12,
+                                paddingVertical: 9,
+                                borderRadius: 9,
+                                backgroundColor: scope === value ? "#5865f2" : "#1e1f22",
+                                marginRight: 7,
+                                marginBottom: 7,
+                            }}
+                        >
+                            <Text style={{ color: "#fff", fontWeight: "700" }}>
+                                {value === "guild" ? "Server" : value[0].toUpperCase() + value.slice(1)}
+                            </Text>
+                        </Pressable>
+                    ))}
+                </View>
+            </Section>
+
+            {scope !== "everywhere" && (
+                <Section title="Location">
+                    <Input
+                        value={locationSearch}
+                        onChangeText={setLocationSearch}
+                        placeholder="Find servers, DMs, channels..."
+                    />
+
+                    {loadingLocations ? (
+                        <ActivityIndicator />
+                    ) : (
+                        filteredLocations
+                            .filter(location => {
+                                if (scope === "guild") return location.type === "guild";
+                                if (scope === "dm") return location.type === "dm";
+                                return location.type === "channel";
+                            })
+                            .slice(0, 100)
+                            .map(location => (
+                                <LocationRow
+                                    key={`${location.type}:${location.id}`}
+                                    location={location}
+                                    selected={selected?.id === location.id && selected.type === location.type}
+                                    onPress={() => setSelected(location)}
+                                />
+                            ))
+                    )}
+                </Section>
+            )}
+
+            <Section title="Filters">
+                <Label>Author ID</Label>
+                <Input
+                    value={filters.authorId}
+                    onChangeText={(value: string) => setFilters({ ...filters, authorId: value })}
+                    placeholder="Optional user ID"
+                />
+
+                <Label>Mentioned user ID</Label>
+                <Input
+                    value={filters.mentions}
+                    onChangeText={(value: string) => setFilters({ ...filters, mentions: value })}
+                    placeholder="Optional user ID"
+                />
+
+                <Label>Link hostname</Label>
+                <Input
+                    value={filters.linkHostname}
+                    onChangeText={(value: string) => setFilters({ ...filters, linkHostname: value })}
+                    placeholder="example.com"
+                />
+
+                <Label>Attachment extension</Label>
+                <Input
+                    value={filters.attachmentExtension}
+                    onChangeText={(value: string) => setFilters({ ...filters, attachmentExtension: value })}
+                    placeholder="png, mp4, pdf..."
+                />
+
+                <Label>Attachment filename</Label>
+                <Input
+                    value={filters.attachmentFilename}
+                    onChangeText={(value: string) => setFilters({ ...filters, attachmentFilename: value })}
+                    placeholder="report"
+                />
+
+                <Label>After</Label>
+                <Input
+                    value={filters.after}
+                    onChangeText={(value: string) => setFilters({ ...filters, after: value })}
+                    placeholder="ISO timestamp or message ID"
+                />
+
+                <Label>Before</Label>
+                <Input
+                    value={filters.before}
+                    onChangeText={(value: string) => setFilters({ ...filters, before: value })}
+                    placeholder="ISO timestamp or message ID"
+                />
+
+                <Label>Author type</Label>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                    {["", "user", "bot", "webhook"].map(value => (
+                        <Pressable
+                            key={value || "all"}
+                            onPress={() => setFilters({ ...filters, authorType: value as SearchFilters["authorType"] })}
+                            style={{
+                                backgroundColor: filters.authorType === value ? "#5865f2" : "#1e1f22",
+                                paddingHorizontal: 11,
+                                paddingVertical: 8,
+                                borderRadius: 8,
+                                marginRight: 6,
+                                marginBottom: 6,
+                            }}
+                        >
+                            <Text style={{ color: "#fff" }}>{value || "Everyone"}</Text>
+                        </Pressable>
+                    ))}
+                </View>
+
+                <Label>Contains</Label>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                    {["link", "embed", "file", "image", "video", "poll"].map(value => {
+                        const active = filters.has.includes(value);
+                        return (
+                            <Pressable
+                                key={value}
+                                onPress={() =>
+                                    setFilters({
+                                        ...filters,
+                                        has: active
+                                            ? filters.has.filter(item => item !== value)
+                                            : [...filters.has, value],
+                                    })
+                                }
+                                style={{
+                                    backgroundColor: active ? "#5865f2" : "#1e1f22",
+                                    paddingHorizontal: 11,
+                                    paddingVertical: 8,
+                                    borderRadius: 8,
+                                    marginRight: 6,
+                                    marginBottom: 6,
+                                }}
+                            >
+                                <Text style={{ color: "#fff" }}>{value}</Text>
+                            </Pressable>
+                        );
+                    })}
+                </View>
+            </Section>
+
+            <Section title="Sort">
+                <View style={{ flexDirection: "row" }}>
+                    {(["timestamp", "relevance"] as Sort[]).map(value => (
+                        <Pressable
+                            key={value}
+                            onPress={() => setSort(value)}
+                            style={{
+                                backgroundColor: sort === value ? "#5865f2" : "#1e1f22",
+                                paddingHorizontal: 12,
+                                paddingVertical: 9,
+                                borderRadius: 8,
+                                marginRight: 7,
+                            }}
+                        >
+                            <Text style={{ color: "#fff" }}>
+                                {value === "timestamp" ? "Time" : "Relevance"}
+                            </Text>
+                        </Pressable>
+                    ))}
+                </View>
+
+                <View style={{ flexDirection: "row", marginTop: 8 }}>
+                    {(["desc", "asc"] as Order[]).map(value => (
+                        <Pressable
+                            key={value}
+                            onPress={() => setOrder(value)}
+                            style={{
+                                backgroundColor: order === value ? "#5865f2" : "#1e1f22",
+                                paddingHorizontal: 12,
+                                paddingVertical: 9,
+                                borderRadius: 8,
+                                marginRight: 7,
+                            }}
+                        >
+                            <Text style={{ color: "#fff" }}>
+                                {value === "desc" ? "Newest" : "Oldest"}
+                            </Text>
+                        </Pressable>
+                    ))}
+                </View>
+            </Section>
+
+            <Button
+                title={loadingSearch ? "Searching..." : "Search Discord"}
+                onPress={executeSearch}
+                disabled={loadingSearch}
+            />
+
+            {!!error && (
+                <View style={{ backgroundColor: "#4a2428", borderRadius: 10, padding: 12, marginBottom: 12 }}>
+                    <Text style={{ color: "#ffb3b8" }}>{error}</Text>
+                </View>
+            )}
+
+            {!!results.length && (
+                <Section title={`${results.length} results`}>
+                    {results.map(result => (
+                        <Pressable
+                            key={`${result.channelId}:${result.id}`}
+                            onPress={() => jumpToResult(result)}
+                            style={{
+                                backgroundColor: "#1e1f22",
+                                borderRadius: 10,
+                                padding: 12,
+                                marginBottom: 8,
+                            }}
+                        >
+                            <Text style={{ color: "#f2f3f5", fontWeight: "700" }}>
+                                {result.author?.global_name || result.author?.username || "Unknown user"}
+                            </Text>
+                            <Text style={{ color: "#949ba4", fontSize: 12, marginTop: 2 }}>
+                                {new Date(result.timestamp).toLocaleString()}
+                            </Text>
+                            <Text style={{ color: "#dbdee1", marginTop: 7 }} numberOfLines={8}>
+                                {result.content || "[No text content]"}
+                            </Text>
+                            {!!result.attachments?.length && (
+                                <Text style={{ color: "#949ba4", fontSize: 12, marginTop: 7 }}>
+                                    {result.attachments.length} attachment{result.attachments.length === 1 ? "" : "s"}
+                                </Text>
+                            )}
+                        </Pressable>
+                    ))}
+                </Section>
+            )}
+        </ScrollView>
+    );
+}
+
+let navigation: any = null;
+
+function openSearchScreen() {
+    const nav = findByProps("push", "pop", "replace");
+    if (nav?.push) {
+        nav.push("SearchPlus", { component: SearchScreen });
+        return;
+    }
+
+    const stack = findByProps("open", "close");
+    if (stack?.open) {
+        stack.open({
+            title: "Search+",
+            render: () => <SearchScreen />,
+        });
+        return;
+    }
+
+    console.warn("[Search+] Could not locate a navigation/modal API.");
+}
+
 export default {
-    onLoad() {},
-    onUnload() {},
+    onLoad() {
+        initialize();
+    },
+
+    onUnload() {
+        navigation = null;
+    },
+
     settings: Settings,
 };
