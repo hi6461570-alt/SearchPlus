@@ -1,0 +1,19 @@
+{
+  "name": "search-plus-shiggy",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.tsx --bundle --format=esm --platform=neutral --outfile=dist/index.js --external:@vendetta/* --external:react --external:react-native",
+    "build:watch": "npm run build -- --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
+  },
+  "dependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-native": "^0.74.0",
+    "react": "^19.0.0"
+  }
+}

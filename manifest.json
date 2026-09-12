@@ -1,0 +1,9 @@
+{
+  "name": "Search+",
+  "description": "Advanced Discord message search for ShiggyCord/Kettu.",
+  "authors": [
+    "Search+"
+  ],
+  "version": "1.0.0",
+  "main": "dist/index.js"
+}
